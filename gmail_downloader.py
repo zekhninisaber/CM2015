@@ -165,7 +165,13 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
         msg_dir = output_dir / f"{msg_id}_{safe_subject}"
         msg_dir.mkdir(parents=True, exist_ok=True)
 
-        dest = msg_dir / filename
+        # Sanitize filename: replace path separators and other illegal Windows
+        # characters so they never create unexpected subdirectories.
+        safe_filename = "".join(
+            c if c.isalnum() or c in " ._-" else "_"
+            for c in filename
+        )
+        dest = msg_dir / safe_filename
         dest.write_bytes(data)
         print(f"  [SAVED] {dest}")
         saved += 1
