@@ -1,7 +1,8 @@
 """
 Gmail Attachment Downloader
 ----------------------------
-Downloads all attachments from Gmail messages received on or after a given date.
+Downloads invoice attachments from Gmail messages received on or after a given date.
+Only files whose name or the email subject contains an invoice-related keyword are saved.
 
 Usage:
     python gmail_downloader.py --since 2024-01-01 --output ./downloads
@@ -18,6 +19,7 @@ A token.json file is saved locally so you only authenticate once.
 import argparse
 import base64
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -129,11 +131,30 @@ def get_parts(payload: dict) -> list[dict]:
     return parts
 
 
+# Keywords that identify invoice-related files/emails, across common languages.
+# EN=English  FR=French  NL=Dutch  DE=German  ES=Spanish  IT=Italian  PT=Portuguese
+_INVOICE_KEYWORDS = re.compile(
+    r"invoice|facture|factuur|rechnung|factura|fattura|fatura"   # invoice
+    r"|receipt|reçu|recu|quittung|recibo|ricevuta|recibo"        # receipt
+    r"|bill|bon de|nota ",                                        # bill / misc
+    re.IGNORECASE,
+)
+
+
+def is_invoice(filename: str, subject: str) -> bool:
+    """Return True if the attachment or its email looks like an invoice."""
+    return bool(
+        _INVOICE_KEYWORDS.search(filename)
+        or _INVOICE_KEYWORDS.search(subject)
+    )
+
+
 def download_attachments(service, message: dict, output_dir: Path) -> int:
     """
-    Download every attachment in *message* to *output_dir*.
+    Download invoice attachments in *message* to *output_dir*.
 
-    Returns the number of attachments saved.
+    Only attachments whose filename or email subject matches an invoice-related
+    keyword are saved. Returns the number of attachments saved.
     """
     saved = 0
     msg_id = message["id"]
@@ -147,6 +168,11 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
 
         # Skip parts that are not file attachments
         if not filename or not attachment_id:
+            continue
+
+        # Skip attachments that don't look like invoices
+        if not is_invoice(filename, subject):
+            print(f"  [SKIP] {filename!r} (not an invoice)")
             continue
 
         # Fetch the attachment data
