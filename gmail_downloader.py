@@ -18,6 +18,7 @@ A token.json file is saved locally so you only authenticate once.
 
 import argparse
 import base64
+import io
 import os
 import re
 import sys
@@ -131,22 +132,62 @@ def get_parts(payload: dict) -> list[dict]:
     return parts
 
 
-# Keywords that identify invoice-related files/emails, across common languages.
+# Keywords that identify invoice/receipt content, across common languages.
 # EN=English  FR=French  NL=Dutch  DE=German  ES=Spanish  IT=Italian  PT=Portuguese
 _INVOICE_KEYWORDS = re.compile(
     r"invoice|facture|factuur|rechnung|factura|fattura|fatura"   # invoice
-    r"|receipt|reçu|recu|quittung|recibo|ricevuta|recibo"        # receipt
-    r"|bill|bon de|nota ",                                        # bill / misc
+    r"|receipt|reçu|recu|quittung|recibo|ricevuta"               # receipt
+    r"|total\s*(due|amount|ht|ttc|excl|incl)"                    # totals
+    r"|montant\s*(total|ht|ttc)"                                  # FR totals
+    r"|btw|tva|mwst|vat|iva"                                     # tax labels
+    r"|bill\s*to|ship\s*to|sold\s*to"                            # EN billing
+    r"|bon de commande|devis",                                    # FR order/quote
     re.IGNORECASE,
 )
 
 
-def is_invoice(filename: str, subject: str) -> bool:
-    """Return True if the attachment or its email looks like an invoice."""
-    return bool(
-        _INVOICE_KEYWORDS.search(filename)
-        or _INVOICE_KEYWORDS.search(subject)
-    )
+def _extract_text(data: bytes, filename: str) -> str | None:
+    """
+    Try to extract plain text from *data*.
+
+    Returns the extracted text, or None if the format is not supported /
+    a required library is missing.
+    """
+    lower = filename.lower()
+
+    # --- PDF ---
+    if lower.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader  # type: ignore
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception:
+            return None
+
+    # --- Raster images (OCR) ---
+    if lower.endswith((".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp")):
+        try:
+            import pytesseract          # type: ignore
+            from PIL import Image       # type: ignore
+            return pytesseract.image_to_string(Image.open(io.BytesIO(data)))
+        except Exception:
+            return None
+
+    return None  # unsupported format
+
+
+def is_invoice_content(data: bytes, filename: str) -> bool:
+    """
+    Return True if the file *looks* like an invoice based on its content.
+
+    For formats we cannot parse (e.g. .zip, .xml), we return True so that
+    potentially relevant files are never silently dropped.
+    """
+    text = _extract_text(data, filename)
+    if text is None:
+        # Can't read the content — keep the file to be safe.
+        return True
+    return bool(_INVOICE_KEYWORDS.search(text))
 
 
 def download_attachments(service, message: dict, output_dir: Path) -> int:
@@ -170,12 +211,7 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
         if not filename or not attachment_id:
             continue
 
-        # Skip attachments that don't look like invoices
-        if not is_invoice(filename, subject):
-            print(f"  [SKIP] {filename!r} (not an invoice)")
-            continue
-
-        # Fetch the attachment data
+        # Fetch the attachment data first so we can inspect its content
         attachment = (
             service.users()
             .messages()
@@ -185,6 +221,11 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
         )
 
         data = base64.urlsafe_b64decode(attachment["data"])
+
+        # Skip if the file content does not look like an invoice
+        if not is_invoice_content(data, filename):
+            print(f"  [SKIP] {filename!r} (content does not match invoice keywords)")
+            continue
 
         # Build a safe output path, creating per-message subdirectories
         safe_subject = "".join(c if c.isalnum() or c in " _-" else "_" for c in subject)[:60]
