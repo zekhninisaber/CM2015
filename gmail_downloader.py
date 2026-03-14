@@ -1,19 +1,29 @@
 """
 Gmail Attachment Downloader
 ----------------------------
-Downloads invoice attachments from Gmail messages received on or after a given date.
-Only files whose name or the email subject contains an invoice-related keyword are saved.
+Downloads attachments from Gmail in two modes:
 
-Usage:
-    python gmail_downloader.py --since 2024-01-01 --output ./downloads
+  Invoice mode (default)
+      Reads each attachment's content and saves it only when invoice/receipt
+      keywords are found inside the file.
+
+      python gmail_downloader.py --since 2024-01-01 --output ./invoices
+
+  Label mode (--label)
+      Downloads every attachment from emails carrying the given Gmail label.
+      No content filtering is applied — the label is already the classifier.
+
+      python gmail_downloader.py --since 2024-01-01 --label "CV Actiris" \\
+          --output ./cvs --token token_cv.json
+
+      The --token option lets you authenticate a separate Gmail account.
+      On first use a browser window opens for OAuth; afterwards the token
+      is reused from the specified file.
 
 Requirements:
     1. A Google Cloud project with the Gmail API enabled.
     2. An OAuth 2.0 credential file (credentials.json) in the same directory.
     3. Run `pip install -r requirements.txt` before first use.
-
-First run will open a browser window for Google OAuth authentication.
-A token.json file is saved locally so you only authenticate once.
 """
 
 import argparse
@@ -35,19 +45,19 @@ from googleapiclient.errors import HttpError
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 CREDENTIALS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
+DEFAULT_TOKEN_FILE = "token.json"
 
 
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
 
-def authenticate() -> Credentials:
+def authenticate(token_file: str = DEFAULT_TOKEN_FILE) -> Credentials:
     """Return valid Gmail API credentials, refreshing or re-authorising as needed."""
     creds = None
 
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -61,9 +71,9 @@ def authenticate() -> Credentials:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w") as token_file:
-            token_file.write(creds.to_json())
-        print(f"[INFO] Credentials saved to '{TOKEN_FILE}'.")
+        with open(token_file, "w") as f:
+            f.write(creds.to_json())
+        print(f"[INFO] Credentials saved to '{token_file}'.")
 
     return creds
 
@@ -82,10 +92,26 @@ def build_query(since: datetime, sender: str | None = None) -> str:
     return query
 
 
-def list_messages(service, query: str) -> list[dict]:
+def get_label_id(service, label_name: str) -> str:
+    """Return the Gmail label ID for the given display name, or exit with an error."""
+    result = service.users().labels().list(userId="me").execute()
+    for label in result.get("labels", []):
+        if label["name"].lower() == label_name.lower():
+            return label["id"]
+    available = ", ".join(f'"{lb["name"]}"' for lb in result.get("labels", []))
+    sys.exit(
+        f"[ERROR] Label '{label_name}' not found.\n"
+        f"Available labels: {available}"
+    )
+
+
+def list_messages(service, query: str, label_ids: list[str] | None = None) -> list[dict]:
     """Return all message stubs matching *query* (handles pagination)."""
     messages = []
-    response = service.users().messages().list(userId="me", q=query).execute()
+    kwargs: dict = {"userId": "me", "q": query}
+    if label_ids:
+        kwargs["labelIds"] = label_ids
+    response = service.users().messages().list(**kwargs).execute()
 
     while True:
         messages.extend(response.get("messages", []))
@@ -95,7 +121,7 @@ def list_messages(service, query: str) -> list[dict]:
         response = (
             service.users()
             .messages()
-            .list(userId="me", q=query, pageToken=page_token)
+            .list(**kwargs, pageToken=page_token)
             .execute()
         )
 
@@ -190,12 +216,17 @@ def is_invoice_content(data: bytes, filename: str) -> bool:
     return bool(_INVOICE_KEYWORDS.search(text))
 
 
-def download_attachments(service, message: dict, output_dir: Path) -> int:
+def download_attachments(
+    service, message: dict, output_dir: Path, check_content: bool = True
+) -> int:
     """
-    Download invoice attachments in *message* to *output_dir*.
+    Download attachments in *message* to *output_dir*.
 
-    Only attachments whose filename or email subject matches an invoice-related
-    keyword are saved. Returns the number of attachments saved.
+    When *check_content* is True (invoice mode) each file's content is read
+    and must match invoice keywords to be saved.  When False (label mode) all
+    attachments are saved — the Gmail label is already the filter.
+
+    Returns the number of attachments saved.
     """
     saved = 0
     msg_id = message["id"]
@@ -211,7 +242,7 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
         if not filename or not attachment_id:
             continue
 
-        # Fetch the attachment data first so we can inspect its content
+        # Fetch the attachment data
         attachment = (
             service.users()
             .messages()
@@ -222,8 +253,8 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
 
         data = base64.urlsafe_b64decode(attachment["data"])
 
-        # Skip if the file content does not look like an invoice
-        if not is_invoice_content(data, filename):
+        # In invoice mode, verify content before saving
+        if check_content and not is_invoice_content(data, filename):
             print(f"  [SKIP] {filename!r} (content does not match invoice keywords)")
             continue
 
@@ -252,7 +283,12 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download Gmail attachments received on or after a given date."
+        description=(
+            "Download Gmail attachments received on or after a given date.\n\n"
+            "Invoice mode (default): checks attachment content for invoice keywords.\n"
+            "Label mode (--label): downloads all attachments from emails with that label."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--since",
@@ -270,7 +306,25 @@ def parse_args() -> argparse.Namespace:
         "--sender",
         default=None,
         metavar="EMAIL",
-        help="Optional: restrict search to emails from a specific sender.",
+        help="Restrict search to emails from a specific sender.",
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Download all attachments from emails carrying this Gmail label "
+            "(e.g. 'CV Actiris'). Skips content-keyword filtering."
+        ),
+    )
+    parser.add_argument(
+        "--token",
+        default=DEFAULT_TOKEN_FILE,
+        metavar="FILE",
+        help=(
+            f"OAuth token file to use (default: {DEFAULT_TOKEN_FILE}). "
+            "Use a different file to authenticate a second Gmail account."
+        ),
     )
     return parser.parse_args()
 
@@ -287,21 +341,31 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Authenticating with Gmail API…")
-    creds = authenticate()
+    print("[INFO] Authenticating with Gmail API…")
+    creds = authenticate(args.token)
     service = build("gmail", "v1", credentials=creds)
+
+    # Resolve label filter (if requested)
+    label_ids: list[str] | None = None
+    if args.label:
+        label_id = get_label_id(service, args.label)
+        label_ids = [label_id]
+        print(f"[INFO] Using label '{args.label}' (id={label_id})")
 
     query = build_query(since, sender=args.sender)
     print(f"[INFO] Searching Gmail with query: {query!r}")
 
     try:
-        messages = list_messages(service, query)
+        messages = list_messages(service, query, label_ids=label_ids)
     except HttpError as err:
         sys.exit(f"[ERROR] Gmail API error: {err}")
 
     if not messages:
         print("[INFO] No messages with attachments found for the given criteria.")
         return
+
+    # In label mode we trust the label; in invoice mode we read each file.
+    check_content = args.label is None
 
     print(f"[INFO] Found {len(messages)} message(s). Downloading attachments…\n")
 
@@ -310,7 +374,7 @@ def main() -> None:
         message = get_message(service, stub["id"])
         subject = extract_subject(message)
         print(f"[{i}/{len(messages)}] {subject}")
-        count = download_attachments(service, message, output_dir)
+        count = download_attachments(service, message, output_dir, check_content=check_content)
         if count == 0:
             print("  (no downloadable attachments)")
         total_attachments += count
