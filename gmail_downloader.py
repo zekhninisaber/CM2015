@@ -259,7 +259,7 @@ def download_attachments(
             continue
 
         # Build a safe output path, creating per-message subdirectories
-        safe_subject = "".join(c if c.isalnum() or c in " _-" else "_" for c in subject)[:60]
+        safe_subject = "".join(c if c.isalnum() or c in " _-" else "_" for c in subject)[:60].strip()
         msg_dir = output_dir / f"{msg_id}_{safe_subject}"
         msg_dir.mkdir(parents=True, exist_ok=True)
 
